@@ -7,4 +7,10 @@
 build
 *.whl
 tmp
-
+cmake_build
+build
+.cache
+output
+.idea
+cmake-build-*
+.listing

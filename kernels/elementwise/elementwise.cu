@@ -1,14 +1,15 @@
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
+#include <cuda_runtime.h>
+#include <float.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <float.h>
-#include <vector>
-#include <algorithm>
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
-#include <cuda_bf16.h>
-#include <cuda_fp8.h>
-#include <torch/types.h>
 #include <torch/extension.h>
+#include <torch/types.h>
+
+#include <algorithm>
+#include <vector>
 
 #define WARP_SIZE 32
 #define INT4(value) (reinterpret_cast<int4*>(&(value))[0])
@@ -17,8 +18,8 @@
 #define BFLOAT2(value) (reinterpret_cast<__nv_bfloat162*>(&(value))[0])
 #define LDST128BITS(value) (reinterpret_cast<float4*>(&(value))[0])
 
-// -------------------------------------- FP32 -------------------------------------- 
-// ElementWise Add  
+// -------------------------------------- FP32 --------------------------------------
+// ElementWise Add
 // grid(N/256), block(256)
 // a: Nx1, b: Nx1, c: Nx1, c = elementwise_add(a, b)
 __global__ void elementwise_add_f32_kernel(float* a, float* b, float* c, int N) {
@@ -43,13 +44,13 @@ __global__ void elementwise_add_f32x4_kernel(float* a, float* b, float* c, int N
   }
 }
 
-// -------------------------------------- FP16 -------------------------------------- 
-// ElementWise Add  
+// -------------------------------------- FP16 --------------------------------------
+// ElementWise Add
 // grid(N/256), block(256)
 // a: Nx1, b: Nx1, c: Nx1, c = elementwise_add(a, b)
 __global__ void elementwise_add_f16_kernel(half* a, half* b, half* c, int N) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx < N) c[idx] = __hadd(a[idx], b[idx]);
+  if (idx < N) c[idx] = a[idx] + b[idx];
 }
 
 // a: Nx1, b: Nx1, c: Nx1, c = elementwise_add(a, b)
@@ -84,10 +85,18 @@ __global__ void elementwise_add_f16x8_kernel(half* a, half* b, half* c, int N) {
   reg_c_2.y = __hadd(reg_a_2.y, reg_b_2.y);
   reg_c_3.x = __hadd(reg_a_3.x, reg_b_3.x);
   reg_c_3.y = __hadd(reg_a_3.y, reg_b_3.y);
-  if ((idx + 0) < N) { HALF2(c[idx + 0]) = reg_c_0; }
-  if ((idx + 2) < N) { HALF2(c[idx + 2]) = reg_c_1; }
-  if ((idx + 4) < N) { HALF2(c[idx + 4]) = reg_c_2; }
-  if ((idx + 6) < N) { HALF2(c[idx + 6]) = reg_c_3; }
+  if ((idx + 0) < N) {
+    HALF2(c[idx + 0]) = reg_c_0;
+  }
+  if ((idx + 2) < N) {
+    HALF2(c[idx + 2]) = reg_c_1;
+  }
+  if ((idx + 4) < N) {
+    HALF2(c[idx + 4]) = reg_c_2;
+  }
+  if ((idx + 6) < N) {
+    HALF2(c[idx + 6]) = reg_c_3;
+  }
 }
 
 __global__ void elementwise_add_f16x8_pack_kernel(half* a, half* b, half* c, int N) {
@@ -98,74 +107,150 @@ __global__ void elementwise_add_f16x8_pack_kernel(half* a, half* b, half* c, int
   LDST128BITS(pack_a[0]) = LDST128BITS(a[idx]); // load 128 bits
   LDST128BITS(pack_b[0]) = LDST128BITS(b[idx]); // load 128 bits
 
-  #pragma unroll
+#pragma unroll
   for (int i = 0; i < 8; i += 2) {
     // __hadd2 for half2 x 4
     HALF2(pack_c[i]) = __hadd2(HALF2(pack_a[i]), HALF2(pack_b[i]));
   }
   // reinterpret as float4 and store 128 bits in 1 memory issue.
-  if ((idx + 7) < N) { LDST128BITS(c[idx]) = LDST128BITS(pack_c[0]); }
+  if ((idx + 7) < N) {
+    LDST128BITS(c[idx]) = LDST128BITS(pack_c[0]);
+  }
 }
 
+// -------------------------------------- BFP16 --------------------------------------
+// ElementWise Add
+// grid(N/256), block(256)
+// a: Nx1, b: Nx1, c: Nx1, c = elementwise_add(a, b)
+__global__ void elementwise_add_bf16_kernel(__nv_bfloat16* a, __nv_bfloat16* b, __nv_bfloat16* c, int N) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < N) c[idx] = a[idx] + b[idx];
+}
+
+// a: Nx1, b: Nx1, c: Nx1, c = elementwise_add(a, b)
+__global__ void elementwise_add_bf16x2_kernel(__nv_bfloat16* a, __nv_bfloat16* b, __nv_bfloat16* c, int N) {
+  int idx = 2 * (blockIdx.x * blockDim.x + threadIdx.x);
+  if (idx < N) {
+    __nv_bfloat162 reg_a = BFLOAT2(a[idx]);
+    __nv_bfloat162 reg_b = BFLOAT2(b[idx]);
+    __nv_bfloat162 reg_c;
+    reg_c.x = __hadd(reg_a.x, reg_b.x);
+    reg_c.y = __hadd(reg_a.y, reg_b.y);
+    BFLOAT2(c[idx]) = reg_c;
+  }
+}
+
+__global__ void elementwise_add_bf16x8_kernel(__nv_bfloat16* a, __nv_bfloat16* b, __nv_bfloat16* c, int N) {
+  int idx = 8 * (blockIdx.x * blockDim.x + threadIdx.x);
+  __nv_bfloat162 reg_a_0 = BFLOAT2(a[idx + 0]);
+  __nv_bfloat162 reg_a_1 = BFLOAT2(a[idx + 2]);
+  __nv_bfloat162 reg_a_2 = BFLOAT2(a[idx + 4]);
+  __nv_bfloat162 reg_a_3 = BFLOAT2(a[idx + 6]);
+  __nv_bfloat162 reg_b_0 = BFLOAT2(b[idx + 0]);
+  __nv_bfloat162 reg_b_1 = BFLOAT2(b[idx + 2]);
+  __nv_bfloat162 reg_b_2 = BFLOAT2(b[idx + 4]);
+  __nv_bfloat162 reg_b_3 = BFLOAT2(b[idx + 6]);
+  __nv_bfloat162 reg_c_0, reg_c_1, reg_c_2, reg_c_3;
+  reg_c_0.x = __hadd(reg_a_0.x, reg_b_0.x);
+  reg_c_0.y = __hadd(reg_a_0.y, reg_b_0.y);
+  reg_c_1.x = __hadd(reg_a_1.x, reg_b_1.x);
+  reg_c_1.y = __hadd(reg_a_1.y, reg_b_1.y);
+  reg_c_2.x = __hadd(reg_a_2.x, reg_b_2.x);
+  reg_c_2.y = __hadd(reg_a_2.y, reg_b_2.y);
+  reg_c_3.x = __hadd(reg_a_3.x, reg_b_3.x);
+  reg_c_3.y = __hadd(reg_a_3.y, reg_b_3.y);
+  if ((idx + 0) < N) {
+    BFLOAT2(c[idx + 0]) = reg_c_0;
+  }
+  if ((idx + 2) < N) {
+    BFLOAT2(c[idx + 2]) = reg_c_1;
+  }
+  if ((idx + 4) < N) {
+    BFLOAT2(c[idx + 4]) = reg_c_2;
+  }
+  if ((idx + 6) < N) {
+    BFLOAT2(c[idx + 6]) = reg_c_3;
+  }
+}
+
+__global__ void elementwise_add_bf16x8_pack_kernel(__nv_bfloat16* a, __nv_bfloat16* b, __nv_bfloat16* c, int N) {
+  int idx = 8 * (blockIdx.x * blockDim.x + threadIdx.x);
+  // temporary register(memory), .local space in ptx, addressable
+  __nv_bfloat16 pack_a[8], pack_b[8], pack_c[8]; // 8x16 bits=128 bits.
+  // reinterpret as float4 and load 128 bits in 1 memory issue.
+  LDST128BITS(pack_a[0]) = LDST128BITS(a[idx]); // load 128 bits
+  LDST128BITS(pack_b[0]) = LDST128BITS(b[idx]); // load 128 bits
+#pragma unroll
+  for (int i = 0; i < 8; i += 2) {
+    // __hadd2 for half2 x 4
+    BFLOAT2(pack_c[i]) = __hadd2(BFLOAT2(pack_a[i]), BFLOAT2(pack_b[i]));
+  }
+  // reinterpret as float4 and store 128 bits in 1 memory issue.
+  if ((idx + 7) < N) {
+    LDST128BITS(c[idx]) = LDST128BITS(pack_c[0]);
+  }
+}
 
 // --------------------- PyTorch bindings for custom kernel -----------------------
 #define STRINGFY(str) #str
-#define TORCH_BINDING_COMMON_EXTENSION(func) \
-  m.def(STRINGFY(func), &func, STRINGFY(func));
+#define TORCH_BINDING_COMMON_EXTENSION(func) m.def(STRINGFY(func), &func, STRINGFY(func));
 
-#define CHECK_TORCH_TENSOR_DTYPE(T, th_type)                 \
-if(((T).options().dtype() != (th_type))) {                   \
-  std::cout << "Tensor Info:" << (T).options() << std::endl; \
-  throw std::runtime_error("values must be "#th_type);       \
-}
+#define CHECK_TORCH_TENSOR_DTYPE(T, th_type)                   \
+  if (((T).options().dtype() != (th_type))) {                  \
+    std::cout << "Tensor Info:" << (T).options() << std::endl; \
+    throw std::runtime_error("values must be " #th_type);      \
+  }
 
-#define TORCH_BINDING_ELEM_ADD(packed_type, th_type, element_type, n_elements)   \
-void elementwise_add_##packed_type(                                              \
-  torch::Tensor a, torch::Tensor b, torch::Tensor c) {                           \
-  CHECK_TORCH_TENSOR_DTYPE(a, (th_type))                                         \
-  CHECK_TORCH_TENSOR_DTYPE(b, (th_type))                                         \
-  CHECK_TORCH_TENSOR_DTYPE(c, (th_type))                                         \
-  const int ndim = a.dim();                                                      \
-  if (ndim != 2) {                                                               \
-    int N = 1;                                                                   \
-    for (int i = 0; i < ndim; ++i) { N *= a.size(i); }                           \
-    dim3 block(256 / (n_elements));                                              \
-    dim3 grid((N + 256 - 1) / 256);                                              \
-    elementwise_add_##packed_type##_kernel<<<grid, block>>>(                     \
-      reinterpret_cast<element_type*>(a.data_ptr()),                             \
-      reinterpret_cast<element_type*>(b.data_ptr()),                             \
-      reinterpret_cast<element_type*>(c.data_ptr()), N);                         \
-  } else {                                                                       \
-    const int S = a.size(0);                                                     \
-    const int K = a.size(1);                                                     \
-    const int N = S * K;                                                         \
-    if ((K/(n_elements)) <= 1024) {                                              \
-      dim3 block(K/(n_elements));                                                \
-      dim3 grid(S);                                                              \
-      elementwise_add_##packed_type##_kernel<<<grid, block>>>(                   \
-        reinterpret_cast<element_type*>(a.data_ptr()),                           \
-        reinterpret_cast<element_type*>(b.data_ptr()),                           \
-        reinterpret_cast<element_type*>(c.data_ptr()), N);                       \
-    } else {                                                                     \
-      int N = 1;                                                                 \
-      for (int i = 0; i < ndim; ++i) { N *= a.size(i); }                         \
-      dim3 block(256 / (n_elements));                                            \
-      dim3 grid((N + 256 - 1) / 256);                                            \
-      elementwise_add_##packed_type##_kernel<<<grid, block>>>(                   \
-        reinterpret_cast<element_type*>(a.data_ptr()),                           \
-        reinterpret_cast<element_type*>(b.data_ptr()),                           \
-        reinterpret_cast<element_type*>(c.data_ptr()), N);                       \
-    }                                                                            \
-  }                                                                              \
-}
+#define TORCH_BINDING_ELEM_ADD(packed_type, th_type, element_type, n_elements)                                     \
+  void elementwise_add_##packed_type(torch::Tensor a, torch::Tensor b, torch::Tensor c) {                          \
+    CHECK_TORCH_TENSOR_DTYPE(a, (th_type))                                                                         \
+    CHECK_TORCH_TENSOR_DTYPE(b, (th_type))                                                                         \
+    CHECK_TORCH_TENSOR_DTYPE(c, (th_type))                                                                         \
+    const int ndim = a.dim();                                                                                      \
+    if (ndim != 2) {                                                                                               \
+      int N = 1;                                                                                                   \
+      for (int i = 0; i < ndim; ++i) {                                                                             \
+        N *= a.size(i);                                                                                            \
+      }                                                                                                            \
+      dim3 block(256 / (n_elements));                                                                              \
+      dim3 grid((N + 256 - 1) / 256);                                                                              \
+      elementwise_add_##packed_type##_kernel<<<grid, block>>>(reinterpret_cast<element_type*>(a.data_ptr()),       \
+                                                              reinterpret_cast<element_type*>(b.data_ptr()),       \
+                                                              reinterpret_cast<element_type*>(c.data_ptr()), N);   \
+    } else {                                                                                                       \
+      const int S = a.size(0);                                                                                     \
+      const int K = a.size(1);                                                                                     \
+      const int N = S * K;                                                                                         \
+      if ((K / (n_elements)) <= 1024) {                                                                            \
+        dim3 block(K / (n_elements));                                                                              \
+        dim3 grid(S);                                                                                              \
+        elementwise_add_##packed_type##_kernel<<<grid, block>>>(reinterpret_cast<element_type*>(a.data_ptr()),     \
+                                                                reinterpret_cast<element_type*>(b.data_ptr()),     \
+                                                                reinterpret_cast<element_type*>(c.data_ptr()), N); \
+      } else {                                                                                                     \
+        int N = 1;                                                                                                 \
+        for (int i = 0; i < ndim; ++i) {                                                                           \
+          N *= a.size(i);                                                                                          \
+        }                                                                                                          \
+        dim3 block(256 / (n_elements));                                                                            \
+        dim3 grid((N + 256 - 1) / 256);                                                                            \
+        elementwise_add_##packed_type##_kernel<<<grid, block>>>(reinterpret_cast<element_type*>(a.data_ptr()),     \
+                                                                reinterpret_cast<element_type*>(b.data_ptr()),     \
+                                                                reinterpret_cast<element_type*>(c.data_ptr()), N); \
+      }                                                                                                            \
+    }                                                                                                              \
+  }
 
-
-TORCH_BINDING_ELEM_ADD(f32,         torch::kFloat32,    float,    1)
-TORCH_BINDING_ELEM_ADD(f32x4,       torch::kFloat32,    float,    4)
-TORCH_BINDING_ELEM_ADD(f16,         torch::kHalf,       half,     1)
-TORCH_BINDING_ELEM_ADD(f16x2,       torch::kHalf,       half,     2)
-TORCH_BINDING_ELEM_ADD(f16x8,       torch::kHalf,       half,     8)
-TORCH_BINDING_ELEM_ADD(f16x8_pack,  torch::kHalf,       half,     8)
+TORCH_BINDING_ELEM_ADD(f32, torch::kFloat32, float, 1)
+TORCH_BINDING_ELEM_ADD(f32x4, torch::kFloat32, float, 4)
+TORCH_BINDING_ELEM_ADD(f16, torch::kHalf, half, 1)
+TORCH_BINDING_ELEM_ADD(f16x2, torch::kHalf, half, 2)
+TORCH_BINDING_ELEM_ADD(f16x8, torch::kHalf, half, 8)
+TORCH_BINDING_ELEM_ADD(f16x8_pack, torch::kHalf, half, 8)
+TORCH_BINDING_ELEM_ADD(bf16, torch::kBFloat16, __nv_bfloat16, 1)
+TORCH_BINDING_ELEM_ADD(bf16x2, torch::kBFloat16, __nv_bfloat16, 2)
+TORCH_BINDING_ELEM_ADD(bf16x8, torch::kBFloat16, __nv_bfloat16, 8)
+TORCH_BINDING_ELEM_ADD(bf16x8_pack, torch::kBFloat16, __nv_bfloat16, 8)
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   TORCH_BINDING_COMMON_EXTENSION(elementwise_add_f32)
@@ -174,4 +259,47 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   TORCH_BINDING_COMMON_EXTENSION(elementwise_add_f16x2)
   TORCH_BINDING_COMMON_EXTENSION(elementwise_add_f16x8)
   TORCH_BINDING_COMMON_EXTENSION(elementwise_add_f16x8_pack)
+  TORCH_BINDING_COMMON_EXTENSION(elementwise_add_bf16)
+  TORCH_BINDING_COMMON_EXTENSION(elementwise_add_bf16x2)
+  TORCH_BINDING_COMMON_EXTENSION(elementwise_add_bf16x8)
+  TORCH_BINDING_COMMON_EXTENSION(elementwise_add_bf16x8_pack)
+}
+
+#define RUN_AND_CHECK(func, dtype, th_dtype, N)                                   \
+  {                                                                               \
+    int N = 1024;                                                                 \
+    dtype* a = new dtype[N];                                                      \
+    dtype* b = new dtype[N];                                                      \
+    dtype* c = new dtype[N];                                                      \
+    for (int i = 0; i < N; ++i) {                                                 \
+      a[i] = i;                                                                   \
+      b[i] = i;                                                                   \
+    }                                                                             \
+    torch::Tensor a_tensor = torch::from_blob(a, {N}, th_dtype).to(torch::kCUDA); \
+    torch::Tensor b_tensor = torch::from_blob(b, {N}, th_dtype).to(torch::kCUDA); \
+    torch::Tensor c_tensor = torch::empty({N}, th_dtype).to(torch::kCUDA);        \
+    func(a_tensor, b_tensor, c_tensor);                                           \
+    c_tensor = c_tensor.to(torch::kCPU);                                          \
+    dtype* c_host_ptr = reinterpret_cast<dtype*>(c_tensor.data_ptr());            \
+    for (int i = 0; i < N; ++i) {                                                 \
+      assert(c_host_ptr[i] == a[i] + b[i]);                                       \
+    }                                                                             \
+    std::cout << "Kernel " STRINGFY(func) << " check success!" << std::endl;      \
+    delete[] a;                                                                   \
+    delete[] b;                                                                   \
+    delete[] c;                                                                   \
+  }
+
+int main(int argc, char* argv[]) {
+  RUN_AND_CHECK(elementwise_add_f32, float, torch::kFloat32, N);
+  RUN_AND_CHECK(elementwise_add_f32x4, float, torch::kFloat32, N);
+  RUN_AND_CHECK(elementwise_add_f16, half, torch::kHalf, N);
+  RUN_AND_CHECK(elementwise_add_f16x2, half, torch::kHalf, N);
+  RUN_AND_CHECK(elementwise_add_f16x8, half, torch::kHalf, N);
+  RUN_AND_CHECK(elementwise_add_f16x8_pack, half, torch::kHalf, N);
+  RUN_AND_CHECK(elementwise_add_bf16, __nv_bfloat16, torch::kBFloat16, N);
+  RUN_AND_CHECK(elementwise_add_bf16x2, __nv_bfloat16, torch::kBFloat16, N);
+  RUN_AND_CHECK(elementwise_add_bf16x8, __nv_bfloat16, torch::kBFloat16, N);
+  RUN_AND_CHECK(elementwise_add_bf16x8_pack, __nv_bfloat16, torch::kBFloat16, N);
+  return 0;
 }

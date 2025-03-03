@@ -1,5 +1,5 @@
 import torch
-import time 
+import time
 from torch.utils.cpp_extension import load
 from typing import Optional
 from functools import partial
@@ -7,8 +7,8 @@ from functools import partial
 torch.set_grad_enabled(False)
 
 # Load the CUDA kernel as a python module
-lib = load(name='elementwise_lib', 
-           sources=['elementwise.cu'], 
+lib = load(name='elementwise_lib',
+           sources=['elementwise.cu'],
            extra_cuda_cflags=[
                "-O3",
                 "-U__CUDA_NO_HALF_OPERATORS__",
@@ -18,23 +18,23 @@ lib = load(name='elementwise_lib',
                 "--expt-relaxed-constexpr",
                 "--expt-extended-lambda",
                 "--use_fast_math",
-            ], 
+            ],
            extra_cflags=['-std=c++17'])
 
 
-def run_benchmark(perf_func: callable, a: torch.Tensor, b: torch.Tensor, tag: str, 
-                  out: Optional[torch.Tensor] = None, warmup: int = 10, 
+def run_benchmark(perf_func: callable, a: torch.Tensor, b: torch.Tensor, tag: str,
+                  out: Optional[torch.Tensor] = None, warmup: int = 10,
                   iters: int = 1000, show_all: bool = False):
     # torch.dot vs custom dot_prod kernel
-    if out is not None: 
-        out.fill_(0)    
+    if out is not None:
+        out.fill_(0)
     # warmup
     if out is not None:
         for i in range(warmup):
             perf_func(a, b, out)
     else:
         for i in range(warmup):
-            _ = perf_func(a, b) 
+            _ = perf_func(a, b)
     torch.cuda.synchronize()
     start = time.time()
     # iters
@@ -43,7 +43,7 @@ def run_benchmark(perf_func: callable, a: torch.Tensor, b: torch.Tensor, tag: st
             perf_func(a, b, out)
     else:
         for i in range(iters):
-            out = perf_func(a, b) 
+            out = perf_func(a, b)
     torch.cuda.synchronize()
     end = time.time()
     total_time = (end - start) * 1000 # ms
@@ -79,4 +79,14 @@ for (S, K) in SKs:
     run_benchmark(lib.elementwise_add_f16x8,      a_f16, b_f16, "f16x8",     c_f16)
     run_benchmark(lib.elementwise_add_f16x8_pack, a_f16, b_f16, "f16x8pack", c_f16)
     run_benchmark(partial(torch.add, out=c_f16),  a_f16, b_f16, "f16_th")
+
     print("-" * 85)
+    # a_bf16 = a.bfloat16().contiguous()
+    # b_bf16 = b.bfloat16().contiguous()
+    # c_bf16 = c.bfloat16().contiguous()
+    # run_benchmark(lib.elementwise_add_bf16,        a_bf16, b_bf16, "bf16",       c_bf16)
+    # run_benchmark(lib.elementwise_add_bf16x2,      a_bf16, b_bf16, "bf16x2",     c_bf16)
+    # run_benchmark(lib.elementwise_add_bf16x8,      a_bf16, b_bf16, "bf16x8",     c_bf16)
+    # run_benchmark(lib.elementwise_add_bf16x8_pack, a_bf16, b_bf16, "bf16x8pack", c_bf16)
+    # run_benchmark(partial(torch.add, out=c_bf16),  a_bf16, b_bf16, "bf16_th")
+    # print("-" * 85)
